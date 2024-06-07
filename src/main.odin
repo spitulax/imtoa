@@ -3,30 +3,109 @@ package main
 import "core:bytes"
 import c "core:c/libc"
 import "core:fmt"
+import "core:image"
 import "core:image/png"
 import "core:io"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 
 PROG_NAME :: #config(PROG_NAME, "")
 PROG_VERSION :: #config(PROG_VERSION, "")
 
-DEFAULT_CHAR_GRADIENT :: " .,-+=icowmICMW#"
+//DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
+DEFAULT_CHAR_GRADIENT :: " .-:uoil?JO0M&W#"
 
 main :: proc() {
-  if len(os.args) < 2 {
-    fmt.eprintfln("Usage: %v <image> [char_gradient]", PROG_NAME)
-    os.exit(1)
-  }
+  if !start() do os.exit(1)
+}
 
+start :: proc() -> (ok: bool) {
   prog := Prog{}
-  if !prog_init(&prog) do os.exit(1)
+  prog_init(&prog)
   defer prog_deinit(&prog)
 
+  if !parse_args(&prog) {
+    usage()
+    return false
+  }
+
+  load_image(&prog) or_return
   read_image(&prog)
 
-  if !write_txt(&prog) do os.exit(1)
+  write_txt(&prog) or_return
+
+  return true
+}
+
+usage :: proc() {
+  fmt.eprintfln(
+    "Usage: %v <image> [-g <char_gradient>] [-s <horz_scale:vert_scale>] [-o <output_path>]",
+    PROG_NAME,
+  )
+}
+
+parse_args :: proc(prog: ^Prog) -> (ok: bool) {
+  defer free_all(context.temp_allocator)
+
+  next_args := proc(args: []string) -> (curr: string, next: []string) {
+    if len(args) <= 0 do return "", nil
+    return args[0], args[1:]
+  }
+
+  parsed: int
+  args := os.args
+  _, args = next_args(args)
+  parsed += 1
+
+  prog.img_path, args = next_args(args)
+  parsed += 1
+
+  for len(args) > 0 {
+    arg: string
+    arg, args = next_args(args)
+
+    switch arg {
+    case "-h", "--help":
+      return false
+
+    case "-g":
+      prog.char_gradient, args = next_args(args)
+      parsed += 1
+
+    case "-s":
+      scale_str: string
+      scale_str, args = next_args(args)
+      parsed += 1
+      scale := strings.split(scale_str, ":", context.temp_allocator)
+      if len(scale) != 2 do return false
+      prog.scale = {
+        strconv.parse_uint(scale[0], 10) or_return,
+        strconv.parse_uint(scale[1], 10) or_return,
+      }
+
+    case "-o":
+      prog.output_path, args = next_args(args)
+      parsed += 1
+
+    case:
+      parsed -= 1
+    }
+
+    if args != nil {
+      parsed += 1
+    }
+  }
+
+  if len(os.args) != parsed do return false
+
+  if len(prog.char_gradient) != 16 {
+    fmt.eprintln("Char gradient's length is not 16 characters")
+    return false
+  }
+
+  return true
 }
 
 Pixel :: []byte
@@ -36,26 +115,38 @@ Prog :: struct {
   img:           ^png.Image,
   img_path:      string,
   pixels:        Pixels,
+  /**/
   char_gradient: string,
+  scale:         [2]uint,
+  output_path:   string,
 }
 
-prog_init :: proc(using prog: ^Prog) -> (ok: bool) {
-  img_path = os.args[1]
-  if len(os.args) >= 3 {
-    char_gradient = os.args[2]
-    if len(char_gradient) != 16 {
-      fmt.eprintln("Char gradient's length is not 16 characters")
-      return false
-    }
-  } else {
-    char_gradient = DEFAULT_CHAR_GRADIENT
-  }
+prog_init :: proc(using prog: ^Prog) {
+  char_gradient = DEFAULT_CHAR_GRADIENT
+  scale = {1, 1}
+}
 
+prog_deinit :: proc(using self: ^Prog) {
+  png.destroy(img)
+  for &p in pixels do delete(p)
+  delete(pixels)
+}
+
+load_image :: proc(using prog: ^Prog) -> (ok: bool) {
   err: png.Error
   img, err = png.load_from_file(img_path)
   if err != nil {
-    fmt.eprintfln("Failed to load %v: %v", img_path, err)
-    os.exit(1)
+    fmt.eprintfln("Unable to load %s: %v", img_path, err)
+    #partial switch v in err {
+    case image.General_Image_Error:
+      #partial switch v {
+      case .Unsupported_Format, .Invalid_Signature:
+        fmt.eprintln("Only PNG image is supported for now")
+      case .Unable_To_Read_File:
+        fmt.eprintln("Unable to read", img_path)
+      }
+    }
+    return false
   }
 
   pixels = make(Pixels, img.width * img.height)
@@ -66,17 +157,12 @@ prog_init :: proc(using prog: ^Prog) -> (ok: bool) {
   return true
 }
 
-prog_deinit :: proc(using self: ^Prog) {
-  png.destroy(img)
-  for &p in pixels do delete(p)
-  delete(pixels)
-}
-
 read_image :: proc(using prog: ^Prog) {
+  defer free_all(context.temp_allocator)
+
   err: io.Error
   for err == nil {
-    pixel := make(Pixel, img.channels)
-    defer delete(pixel)
+    pixel := make(Pixel, img.channels, context.temp_allocator)
 
     for &channel in pixel {
       channel, err = bytes.buffer_read_byte(&img.pixels)
@@ -108,12 +194,11 @@ pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> u8 {
 
 write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   defer free_all(context.temp_allocator)
-  file_path := fmt.aprint(
-    filepath.stem(img_path),
-    ".txt",
-    sep = "",
-    allocator = context.temp_allocator,
-  )
+
+  file_path :=
+    output_path != "" \
+    ? output_path \
+    : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
 
   file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
   if file == nil {
@@ -123,10 +208,14 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   defer c.fclose(file)
 
   for y in 0 ..< img.height {
-    for x in 0 ..< img.width {
-      c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
+    for _ in 0 ..< scale.y {
+      for x in 0 ..< img.width {
+        for _ in 0 ..< scale.x {
+          c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
+        }
+      }
+      c.fprintf(file, "\n")
     }
-    c.fprintf(file, "\n")
   }
 
   return true
