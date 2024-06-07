@@ -49,18 +49,17 @@ usage :: proc() {
 parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   defer free_all(context.temp_allocator)
 
-  next_args := proc(args: []string) -> (curr: string, next: []string) {
+  next_args :: proc(args: []string, parsed: ^int = nil) -> (curr: string, next: []string) {
     if len(args) <= 0 do return "", nil
+    if parsed != nil do parsed^ += 1
     return args[0], args[1:]
   }
 
   parsed: int
   args := os.args
-  _, args = next_args(args)
-  parsed += 1
+  _, args = next_args(args, &parsed)
 
-  prog.img_path, args = next_args(args)
-  parsed += 1
+  prog.img_path, args = next_args(args, &parsed)
 
   for len(args) > 0 {
     arg: string
@@ -71,13 +70,11 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       return false
 
     case "-g":
-      prog.char_gradient, args = next_args(args)
-      parsed += 1
+      prog.char_gradient, args = next_args(args, &parsed)
 
     case "-s":
       scale_str: string
-      scale_str, args = next_args(args)
-      parsed += 1
+      scale_str, args = next_args(args, &parsed)
       scale := strings.split(scale_str, ":", context.temp_allocator)
       if len(scale) != 2 do return false
       prog.scale = {
@@ -86,8 +83,7 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       }
 
     case "-o":
-      prog.output_path, args = next_args(args)
-      parsed += 1
+      prog.output_path, args = next_args(args, &parsed)
 
     case:
       parsed -= 1
@@ -200,21 +196,42 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
     ? output_path \
     : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
 
-  file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
-  if file == nil {
-    fmt.eprintln("Failed to open %s", file_path)
-    return false
-  }
-  defer c.fclose(file)
+  // NOTE: using libc is faster for some reason
+  when true {
+    file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
+    if file == nil {
+      fmt.eprintln("Failed to open %s", file_path)
+      return false
+    }
+    defer c.fclose(file)
 
-  for y in 0 ..< img.height {
-    for _ in 0 ..< scale.y {
-      for x in 0 ..< img.width {
-        for _ in 0 ..< scale.x {
-          c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
+    for y in 0 ..< img.height {
+      for _ in 0 ..< scale.y {
+        for x in 0 ..< img.width {
+          for _ in 0 ..< scale.x {
+            c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
+          }
         }
+        c.fprintf(file, "\n")
       }
-      c.fprintf(file, "\n")
+    }
+  } else {
+    file, err := os.open(file_path, os.O_CREATE | os.O_WRONLY, 0o644)
+    if err != os.ERROR_NONE {
+      fmt.eprintfln("Failed to open %s", file_path)
+      return false
+    }
+    defer os.close(file)
+
+    for y in 0 ..< img.height {
+      for _ in 0 ..< scale.y {
+        for x in 0 ..< img.width {
+          for _ in 0 ..< scale.x {
+            os.write_byte(file, pixel_to_ascii(pixels[x + img.width * y], char_gradient))
+          }
+        }
+        os.write_rune(file, '\n')
+      }
     }
   }
 
