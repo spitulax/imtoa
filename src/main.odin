@@ -41,7 +41,7 @@ start :: proc() -> (ok: bool) {
 
 usage :: proc() {
   fmt.eprintfln(
-    "Usage: %v <image> [-g <char_gradient>] [-s <horz_scale:vert_scale>] [-o <output_path>]",
+    "Usage: %v <image.png> [-g <char_gradient>] [-s <horz_scale:vert_scale>] [-o <output_path>]",
     PROG_NAME,
   )
 }
@@ -59,16 +59,20 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   args := os.args
   _, args = next_args(args, &parsed)
 
-  prog.img_path, args = next_args(args, &parsed)
+  meta_arg: string
+  meta_arg, args = next_args(args, &parsed)
+  switch meta_arg {
+  case "-h", "--help":
+    return false
+  case:
+    prog.img_path = meta_arg
+  }
 
   for len(args) > 0 {
     arg: string
     arg, args = next_args(args)
 
     switch arg {
-    case "-h", "--help":
-      return false
-
     case "-g":
       prog.char_gradient, args = next_args(args, &parsed)
 
