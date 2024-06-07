@@ -176,16 +176,12 @@ print_pixel_hex :: proc(pixel: Pixel) {
   fmt.println()
 }
 
-get_cmax :: proc(pixel: Pixel) -> byte {
-  cmax: byte
-  for i in 0 ..< 3 {
-    cmax = max(cmax, pixel[i])
-  }
-  return cmax
+get_lum :: proc(pixel: Pixel) -> byte {
+  return byte(0.2126 * f32(pixel[0]) + 0.7152 * f32(pixel[1]) + 0.0722 * f32(pixel[2]))
 }
 
 pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> u8 {
-  return char_gradient[int(get_cmax(pixel) / 0x10)]
+  return char_gradient[int(get_lum(pixel) / 0x10)]
 }
 
 write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
