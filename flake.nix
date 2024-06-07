@@ -1,9 +1,12 @@
 {
   description = "Image to ASCII";
 
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    mypkgs.url = "github:spitulax/mypkgs";
+  };
 
-  outputs = { nixpkgs, ... }:
+  outputs = { self, nixpkgs, mypkgs, ... }:
     let
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" "aarch64-linux" ];
@@ -11,6 +14,11 @@
       pkgsFor = eachSystem (system:
         import nixpkgs {
           inherit system;
+          overlays = [
+            (final: prev: {
+              odin = mypkgs.packages.${final.system}.odin;
+            })
+          ];
         });
     in
     {
@@ -20,10 +28,22 @@
         in
         {
           default = pkgs.mkShell {
-            name = "imtoa-shell";
+            name = "imtoa" + "-shell";
+            inputsFrom = with pkgs; [
+              odin
+            ];
             shellHook = "exec $SHELL";
           };
         }
       );
     };
+
+  nixConfig = {
+    extra-substituters = [
+      "spitulax.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "spitulax.cachix.org-1:GQRdtUgc9vwHTkfukneFHFXLPOo0G/2lj2nRw66ENmU="
+    ];
+  };
 }
