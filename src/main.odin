@@ -51,20 +51,21 @@ usage :: proc() {
 }
 
 parse_args :: proc(prog: ^Prog) -> (ok: bool) {
-  defer free_all(context.temp_allocator)
-
-  next_args :: proc(args: []string, parsed: ^int = nil) -> (curr: string, next: []string) {
-    if len(args) <= 0 do return "", nil
+  next_args :: proc(args: ^[]string, parsed: ^int = nil) -> string {
+    args := args
+    if len(args^) <= 0 do return ""
     if parsed != nil do parsed^ += 1
-    return args[0], args[1:]
+    curr := args[0]
+    args^ = args[1:]
+    return curr
   }
 
   parsed: int
   args := os.args
-  _, args = next_args(args, &parsed)
+  _ = next_args(&args, &parsed)
 
   meta_arg: string
-  meta_arg, args = next_args(args, &parsed)
+  meta_arg = next_args(&args, &parsed)
   switch meta_arg {
   case "-h", "--help":
     return false
@@ -74,22 +75,22 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
 
   for len(args) > 0 {
     arg: string
-    arg, args = next_args(args)
+    arg = next_args(&args)
 
     switch arg {
     case "-g":
-      prog.char_gradient, args = next_args(args, &parsed)
+      prog.char_gradient = next_args(&args, &parsed)
 
     case "-s":
       scale_str: string
-      scale_str, args = next_args(args, &parsed)
+      scale_str = next_args(&args, &parsed)
       scale := strings.split(scale_str, ":", context.temp_allocator)
       if len(scale) != 2 do return false
       prog.scale = {strconv.parse_f32(scale[0]) or_return, strconv.parse_f32(scale[1]) or_return}
 
     case "-S":
       size_str: string
-      size_str, args = next_args(args, &parsed)
+      size_str = next_args(&args, &parsed)
       size := strings.split(size_str, "x", context.temp_allocator)
       if len(size) != 2 do return false
       prog.scaled_size = {
@@ -98,7 +99,7 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       }
 
     case "-o":
-      prog.output_path, args = next_args(args, &parsed)
+      prog.output_path = next_args(&args, &parsed)
 
     case "--plain":
       prog.plain = true
@@ -116,6 +117,12 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
 
   if len(prog.char_gradient) != 16 {
     fmt.eprintln("Char gradient's length is not 16 characters")
+    return false
+  }
+  // how can you come up with >255 unique ASCII chars anyway?
+  // but char_gradient could contain duplicate chars
+  if len(prog.char_gradient) > 255 {
+    fmt.eprintln("The gradient is too detailed!")
     return false
   }
 
@@ -177,8 +184,6 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
 }
 
 read_image :: proc(using prog: ^Prog) {
-  defer free_all(context.temp_allocator)
-
   scaled_img_buf := scale_image(img, scaled_size, context.temp_allocator)
 
   for &pixel, i in pixels {
@@ -239,8 +244,6 @@ pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> byte {
 }
 
 write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
-  defer free_all(context.temp_allocator)
-
   file_path :=
     output_path != "" \
     ? output_path \
@@ -293,8 +296,14 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> 
   // stride, [digit:1]... [0x00]
   c.fprintf(file, "%zu", scaled_size.x)
   c.fprintf(file, "%c", 0)
+  // number of unique chars (8-bit integer), [int:1]
+  assert(len(char_gradient) < 256)
+  c.fprintf(file, "%c", byte(len(char_gradient)))
   // lookup table, [char:1] [encoded_size:1] [encoded_value:encoded_size]
   for k, &v in huffman_codes {
+    // print the huffman codes for debugging
+    //fmt.printfln("'%c': %v", k, v)
+
     bytes := str_to_bits(v)
     assert(bytes != nil)
     if len(bytes) > 255 {
@@ -339,15 +348,15 @@ write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: 
   return true
 }
 
-// little-endian
+// big-endian
 str_to_bits :: proc(str: string, allocator := context.allocator) -> []byte {
   acc := make([]byte, (len(str) + 8 - 1) / 8, allocator)
   for c, i in str {
     switch c {
     case '0':
-      acc[i / 8] |= byte(0x00) << (uint(i) % 8)
+      acc[i / 8] |= byte(0x00) >> (uint(i) % 8)
     case '1':
-      acc[i / 8] |= byte(0x01) << (uint(i) % 8)
+      acc[i / 8] |= byte(0x80) >> (uint(i) % 8)
     case 0x00:
       continue
     case:
