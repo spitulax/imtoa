@@ -108,8 +108,8 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   return true
 }
 
-Pixel :: []byte
-Pixels :: distinct []Pixel
+Pixel :: distinct [4]byte
+Pixels :: distinct [dynamic]Pixel
 
 Prog :: struct {
   img:           ^png.Image,
@@ -128,7 +128,6 @@ prog_init :: proc(using prog: ^Prog) {
 
 prog_deinit :: proc(using self: ^Prog) {
   png.destroy(img)
-  for &p in pixels do delete(p)
   delete(pixels)
 }
 
@@ -148,11 +147,12 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
     }
     return false
   }
-
-  pixels = make(Pixels, img.width * img.height)
-  for &pixel in pixels {
-    pixel = make(Pixel, img.channels)
+  if img.channels < 3 || img.channels > 4 {
+    fmt.eprintln("Only RGB and RGBA is supported for now")
+    return false
   }
+
+  pixels = make(Pixels, 0, img.width * img.height)
 
   return true
 }
@@ -162,13 +162,13 @@ read_image :: proc(using prog: ^Prog) {
 
   err: io.Error
   for err == nil {
-    pixel := make(Pixel, img.channels, context.temp_allocator)
+    pixel := Pixel{}
 
-    for &channel in pixel {
-      channel, err = bytes.buffer_read_byte(&img.pixels)
+    for i in 0 ..< img.channels {
+      pixel[i], err = bytes.buffer_read_byte(&img.pixels)
     }
     if img.pixels.off == 0 do break
-    copy(pixels[int((img.pixels.off - img.channels) / img.channels)], pixel)
+    append(&pixels, pixel)
   }
 }
 
@@ -181,7 +181,7 @@ print_pixel_hex :: proc(pixel: Pixel) {
 }
 
 get_lum :: proc(pixel: Pixel) -> byte {
-  return byte(0.2126 * f32(pixel[0]) + 0.7152 * f32(pixel[1]) + 0.0722 * f32(pixel[2]))
+  return byte(0.2126 * f32(pixel.r) + 0.7152 * f32(pixel.g) + 0.0722 * f32(pixel.b))
 }
 
 pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> u8 {
@@ -196,42 +196,22 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
     ? output_path \
     : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
 
-  // NOTE: using libc is faster for some reason
-  when true {
-    file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
-    if file == nil {
-      fmt.eprintln("Failed to open %s", file_path)
-      return false
-    }
-    defer c.fclose(file)
+  // NOTE: using libc is faster than os.open for some reason
+  file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
+  if file == nil {
+    fmt.eprintln("Failed to open %s", file_path)
+    return false
+  }
+  defer c.fclose(file)
 
-    for y in 0 ..< img.height {
-      for _ in 0 ..< scale.y {
-        for x in 0 ..< img.width {
-          for _ in 0 ..< scale.x {
-            c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
-          }
+  for y in 0 ..< img.height {
+    for _ in 0 ..< scale.y {
+      for x in 0 ..< img.width {
+        for _ in 0 ..< scale.x {
+          c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
         }
-        c.fprintf(file, "\n")
       }
-    }
-  } else {
-    file, err := os.open(file_path, os.O_CREATE | os.O_WRONLY, 0o644)
-    if err != os.ERROR_NONE {
-      fmt.eprintfln("Failed to open %s", file_path)
-      return false
-    }
-    defer os.close(file)
-
-    for y in 0 ..< img.height {
-      for _ in 0 ..< scale.y {
-        for x in 0 ..< img.width {
-          for _ in 0 ..< scale.x {
-            os.write_byte(file, pixel_to_ascii(pixels[x + img.width * y], char_gradient))
-          }
-        }
-        os.write_rune(file, '\n')
-      }
+      c.fprintf(file, "\n")
     }
   }
 
