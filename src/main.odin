@@ -1,4 +1,4 @@
-package main
+package imtoa
 
 import c "core:c/libc"
 import pq "core:container/priority_queue"
@@ -273,8 +273,14 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
 }
 
 write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: bool) {
+  arena: virtual.Arena
+  assert(virtual.arena_init_growing(&arena) == nil)
+  defer virtual.arena_destroy(&arena)
+  arena_alloc := virtual.arena_allocator(&arena)
+
+  context.allocator = arena_alloc
+
   char_freq := make(map[byte]uint, len(char_gradient))
-  defer delete(char_freq)
   for char in char_gradient {
     map_insert(&char_freq, u8(char), 0)
   }
@@ -282,55 +288,45 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> 
     char_freq[char] += 1
   }
 
-  arena: virtual.Arena
-  assert(virtual.arena_init_growing(&arena) == nil)
-  defer virtual.arena_destroy(&arena)
-  arena_alloc := virtual.arena_allocator(&arena)
-
-  huffman_tree := huffman_encode(char_freq, arena_alloc)
-  huffman_codes := make(map[byte]string, allocator = arena_alloc)
-  huffman_extract_code(huffman_tree, &huffman_codes, arena_alloc)
+  huffman_tree := huffman_encode(char_freq)
+  huffman_codes := make(map[byte]string)
+  huffman_extract_code(huffman_tree, &huffman_codes)
 
   // magic number
   c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
-  // stride, [digit:1]... [0x00]
+  // stride, [ascii_digit:1]... [0x00]
   c.fprintf(file, "%zu", scaled_size.x)
   c.fprintf(file, "%c", 0)
   // number of unique chars (8-bit integer), [int:1]
   assert(len(char_gradient) < 256)
   c.fprintf(file, "%c", byte(len(char_gradient)))
-  // lookup table, [char:1] [encoded_size:1] [encoded_value:encoded_size]
+  // lookup table, [char:1] [huffman_code_len:1] [encoded_value:len(v)]
   for k, &v in huffman_codes {
     // print the huffman codes for debugging
     //fmt.printfln("'%c': %v", k, v)
 
-    bytes := str_to_bits(v)
-    assert(bytes != nil)
-    if len(bytes) > 255 {
+    if len(v) >= 256 {
       fmt.eprintln("The gradient is too detailed!")
       return false
     }
-    defer delete(bytes)
+    bytes := parse_binary(v, context.temp_allocator)
+    assert(bytes != nil)
     c.fprintf(file, "%c", k)
-    c.fprintf(file, "%c", byte(len(bytes)))
+    c.fprintf(file, "%c", byte(len(v)))
     for &b in bytes {
       c.fprintf(file, "%c", b)
     }
   }
-  // actual data, [huffman_code:variable]
-  encoded_text := make([dynamic]byte, 0, len(text), allocator = arena_alloc)
+  // actual data, [huffman_codes:variable]
+  encoded_text := make([dynamic]byte, 0, len(text))
   for &char in text {
     huffman_code := utf8.string_to_runes(huffman_codes[char])
-    defer delete(huffman_code)
     for &rune in huffman_code {
       encoded_rune, _ := utf8.encode_rune(rune)
       append(&encoded_text, encoded_rune[0])
     }
   }
-  whole_bytes := str_to_bits(
-    strings.clone_from_bytes(encoded_text[:], context.temp_allocator),
-    arena_alloc,
-  )
+  whole_bytes := parse_binary(strings.clone_from_bytes(encoded_text[:], context.temp_allocator))
   for &byte in whole_bytes {
     c.fprintf(file, "%c", byte)
   }
@@ -349,7 +345,7 @@ write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: 
 }
 
 // big-endian
-str_to_bits :: proc(str: string, allocator := context.allocator) -> []byte {
+parse_binary :: proc(str: string, allocator := context.allocator) -> []byte {
   acc := make([]byte, (len(str) + 8 - 1) / 8, allocator)
   for c, i in str {
     switch c {
@@ -416,8 +412,8 @@ huffman_extract_code :: proc(
   if root.data != 0 {
     output[root.data] = fmt.aprint(trail, allocator = allocator)
   }
-  left_str := fmt.aprint(trail, "0", sep = "")
-  right_str := fmt.aprint(trail, "1", sep = "")
+  left_str := fmt.aprint(trail, "0", sep = "", allocator = allocator)
+  right_str := fmt.aprint(trail, "1", sep = "", allocator = allocator)
   defer {
     delete(left_str)
     delete(right_str)
