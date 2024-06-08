@@ -29,8 +29,9 @@
         {
           default = pkgs.mkShell {
             name = "imtoa" + "-shell";
-            inputsFrom = with pkgs; [
+            nativeBuildInputs = with pkgs; [
               odin
+              hexedit
             ];
             shellHook = "exec $SHELL";
           };

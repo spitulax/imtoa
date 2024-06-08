@@ -4,6 +4,7 @@ import c "core:c/libc"
 import "core:fmt"
 import "core:image"
 import "core:image/png"
+import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:strconv"
@@ -11,6 +12,8 @@ import "core:strings"
 
 PROG_NAME :: #config(PROG_NAME, "")
 PROG_VERSION :: #config(PROG_VERSION, "")
+
+AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x59\x4f\x55\x52\x4d\x4f\x4d"
 
 //DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
 //DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
@@ -40,7 +43,7 @@ start :: proc() -> (ok: bool) {
 
 usage :: proc() {
   fmt.eprintfln(
-    "Usage: %v <image.png> [-g <char_gradient>] [-s <hscale:vscale> | -S <WxH>] [-o <output_path>]",
+    "Usage: %v <image.png> [-g <char_gradient>] [-s <hscale:vscale> | -S <WxH>] [-o <output_path>] [--plain]",
     PROG_NAME,
   )
 }
@@ -95,6 +98,9 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
     case "-o":
       prog.output_path, args = next_args(args, &parsed)
 
+    case "--plain":
+      prog.plain = true
+
     case:
       parsed -= 1
     }
@@ -126,6 +132,7 @@ Prog :: struct {
   char_gradient: string,
   scale:         [2]f32,
   output_path:   string,
+  plain:         bool,
 }
 
 prog_init :: proc(using self: ^Prog) {
@@ -225,7 +232,7 @@ get_lum :: proc(pixel: Pixel) -> byte {
   return byte(0.2126 * f32(pixel.r) + 0.7152 * f32(pixel.g) + 0.0722 * f32(pixel.b))
 }
 
-pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> u8 {
+pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> byte {
   return char_gradient[int(get_lum(pixel) / 0x10)]
 }
 
@@ -235,7 +242,16 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   file_path :=
     output_path != "" \
     ? output_path \
-    : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
+    : strings.concatenate(
+      {filepath.stem(img_path), !plain ? ".aim" : ".txt"},
+      context.temp_allocator,
+    )
+
+  text := make([]byte, scaled_size.x * scaled_size.y)
+  for &char, i in text {
+    char = pixel_to_ascii(pixels[i], char_gradient)
+  }
+  defer delete(text)
 
   // NOTE: using libc is faster than os.open for some reason
   file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
@@ -245,11 +261,30 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   }
   defer c.fclose(file)
 
-  for y in 0 ..< scaled_size.y {
-    for x in 0 ..< scaled_size.x {
-      c.fprintf(file, "%c", pixel_to_ascii(pixels[x + scaled_size.x * y], char_gradient))
+  if !plain {
+    char_freq := make(map[byte]uint, len(char_gradient))
+    defer delete(char_freq)
+    for char in char_gradient {
+      map_insert(&char_freq, u8(char), 0)
     }
-    c.fprintf(file, "\n")
+    for &char in text {
+      char_freq[char] += 1
+    }
+
+    arena: virtual.Arena
+    assert(virtual.arena_init_growing(&arena) == nil)
+    defer virtual.arena_destroy(&arena)
+    huffman_tree := huffman_encode(char_freq, virtual.arena_allocator(&arena))
+    _ = huffman_tree
+
+    c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
+  } else {
+    for y in 0 ..< scaled_size.y {
+      for x in 0 ..< scaled_size.x {
+        c.fprintf(file, "%c", text[x + scaled_size.x * y])
+      }
+      c.fprintf(file, "\n")
+    }
   }
 
   return true
