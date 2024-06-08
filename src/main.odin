@@ -1,6 +1,7 @@
 package main
 
 import c "core:c/libc"
+import pq "core:container/priority_queue"
 import "core:fmt"
 import "core:image"
 import "core:image/png"
@@ -9,11 +10,12 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:unicode/utf8"
 
 PROG_NAME :: #config(PROG_NAME, "")
 PROG_VERSION :: #config(PROG_VERSION, "")
 
-AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x59\x4f\x55\x52\x4d\x4f\x4d"
+AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x55\x52\x4d\x4f\x4d"
 
 //DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
 //DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
@@ -261,32 +263,157 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   }
   defer c.fclose(file)
 
-  if !plain {
-    char_freq := make(map[byte]uint, len(char_gradient))
-    defer delete(char_freq)
-    for char in char_gradient {
-      map_insert(&char_freq, u8(char), 0)
-    }
-    for &char in text {
-      char_freq[char] += 1
-    }
+  if plain do write_plain_txt(prog, file, text) or_return
+  else do write_compressed_txt(prog, file, text) or_return
 
-    arena: virtual.Arena
-    assert(virtual.arena_init_growing(&arena) == nil)
-    defer virtual.arena_destroy(&arena)
-    huffman_tree := huffman_encode(char_freq, virtual.arena_allocator(&arena))
-    _ = huffman_tree
+  return true
+}
 
-    c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
-  } else {
-    for y in 0 ..< scaled_size.y {
-      for x in 0 ..< scaled_size.x {
-        c.fprintf(file, "%c", text[x + scaled_size.x * y])
-      }
-      c.fprintf(file, "\n")
+write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: bool) {
+  char_freq := make(map[byte]uint, len(char_gradient))
+  defer delete(char_freq)
+  for char in char_gradient {
+    map_insert(&char_freq, u8(char), 0)
+  }
+  for &char in text {
+    char_freq[char] += 1
+  }
+
+  arena: virtual.Arena
+  assert(virtual.arena_init_growing(&arena) == nil)
+  defer virtual.arena_destroy(&arena)
+  arena_alloc := virtual.arena_allocator(&arena)
+
+  huffman_tree := huffman_encode(char_freq, arena_alloc)
+  huffman_codes := make(map[byte]string, allocator = arena_alloc)
+  huffman_extract_code(huffman_tree, &huffman_codes, arena_alloc)
+
+  // magic number
+  c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
+  // stride, [digit:1]... [0x00]
+  c.fprintf(file, "%zu", scaled_size.x)
+  c.fprintf(file, "%c", 0)
+  // lookup table, [char:1] [encoded_size:1] [encoded_value:encoded_size]
+  for k, &v in huffman_codes {
+    bytes := str_to_bits(v)
+    assert(bytes != nil)
+    if len(bytes) > 255 {
+      fmt.eprintln("The gradient is too detailed!")
+      return false
     }
+    defer delete(bytes)
+    c.fprintf(file, "%c", k)
+    c.fprintf(file, "%c", byte(len(bytes)))
+    for &b in bytes {
+      c.fprintf(file, "%c", b)
+    }
+  }
+  // actual data, [huffman_code:variable]
+  encoded_text := make([dynamic]byte, 0, len(text), allocator = arena_alloc)
+  for &char in text {
+    huffman_code := utf8.string_to_runes(huffman_codes[char])
+    defer delete(huffman_code)
+    for &rune in huffman_code {
+      encoded_rune, _ := utf8.encode_rune(rune)
+      append(&encoded_text, encoded_rune[0])
+    }
+  }
+  whole_bytes := str_to_bits(
+    strings.clone_from_bytes(encoded_text[:], context.temp_allocator),
+    arena_alloc,
+  )
+  for &byte in whole_bytes {
+    c.fprintf(file, "%c", byte)
   }
 
   return true
+}
+
+write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: bool) {
+  for y in 0 ..< scaled_size.y {
+    for x in 0 ..< scaled_size.x {
+      c.fprintf(file, "%c", text[x + scaled_size.x * y])
+    }
+    c.fprintf(file, "\n")
+  }
+  return true
+}
+
+// little-endian
+str_to_bits :: proc(str: string, allocator := context.allocator) -> []byte {
+  acc := make([]byte, (len(str) + 8 - 1) / 8, allocator)
+  for c, i in str {
+    switch c {
+    case '0':
+      acc[i / 8] |= byte(0x00) << (uint(i) % 8)
+    case '1':
+      acc[i / 8] |= byte(0x01) << (uint(i) % 8)
+    case 0x00:
+      continue
+    case:
+      return nil
+    }
+  }
+  return acc
+}
+
+/* HUFFMAN ENCODING STUFF */
+
+HuffmanNode :: struct {
+  data:        byte,
+  freq:        uint,
+  left, right: ^HuffmanNode,
+}
+
+huffman_encode :: proc(data: map[byte]uint, allocator := context.allocator) -> ^HuffmanNode {
+  left, right, top: ^HuffmanNode
+
+  min_heap: pq.Priority_Queue(^HuffmanNode)
+  pq.init(&min_heap, proc(l, r: ^HuffmanNode) -> bool {
+      return l.freq < r.freq
+    }, pq.default_swap_proc(^HuffmanNode))
+  defer pq.destroy(&min_heap)
+
+  for k, v in data {
+    node := new(HuffmanNode, allocator)
+    node.data = k
+    node.freq = v
+    pq.push(&min_heap, node)
+  }
+
+  for pq.len(min_heap) != 1 {
+    left = pq.pop(&min_heap)
+    right = pq.pop(&min_heap)
+    top = new(HuffmanNode, allocator)
+    top^ = {
+      data  = 0, // identifier for internal nodes
+      freq  = left.freq + right.freq,
+      left  = left,
+      right = right,
+    }
+    pq.push(&min_heap, top)
+  }
+
+  return pq.pop(&min_heap)
+}
+
+huffman_extract_code :: proc(
+  root: ^HuffmanNode,
+  output: ^map[byte]string,
+  allocator := context.allocator,
+  trail: string = "",
+) {
+  if root == nil do return
+  if root.data != 0 {
+    output[root.data] = fmt.aprint(trail, allocator = allocator)
+  }
+  left_str := fmt.aprint(trail, "0", sep = "")
+  right_str := fmt.aprint(trail, "1", sep = "")
+  defer {
+    delete(left_str)
+    delete(right_str)
+  }
+  huffman_extract_code(root.left, output, allocator, left_str)
+  huffman_extract_code(root.right, output, allocator, right_str)
 }
 
