@@ -1,11 +1,9 @@
 package main
 
-import "core:bytes"
 import c "core:c/libc"
 import "core:fmt"
 import "core:image"
 import "core:image/png"
-import "core:io"
 import "core:os"
 import "core:path/filepath"
 import "core:strconv"
@@ -15,7 +13,9 @@ PROG_NAME :: #config(PROG_NAME, "")
 PROG_VERSION :: #config(PROG_VERSION, "")
 
 //DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
-DEFAULT_CHAR_GRADIENT :: " .-:uoil?JO0M&W#"
+//DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
+// TODO: variable gradient steps
+DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 
 main :: proc() {
   if !start() do os.exit(1)
@@ -33,7 +33,6 @@ start :: proc() -> (ok: bool) {
 
   load_image(&prog) or_return
   read_image(&prog)
-
   write_txt(&prog) or_return
 
   return true
@@ -41,7 +40,7 @@ start :: proc() -> (ok: bool) {
 
 usage :: proc() {
   fmt.eprintfln(
-    "Usage: %v <image.png> [-g <char_gradient>] [-s <horz_scale:vert_scale>] [-o <output_path>]",
+    "Usage: %v <image.png> [-g <char_gradient>] [-s <hscale:vscale> | -S <WxH>] [-o <output_path>]",
     PROG_NAME,
   )
 }
@@ -81,9 +80,16 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       scale_str, args = next_args(args, &parsed)
       scale := strings.split(scale_str, ":", context.temp_allocator)
       if len(scale) != 2 do return false
-      prog.scale = {
-        strconv.parse_uint(scale[0], 10) or_return,
-        strconv.parse_uint(scale[1], 10) or_return,
+      prog.scale = {strconv.parse_f32(scale[0]) or_return, strconv.parse_f32(scale[1]) or_return}
+
+    case "-S":
+      size_str: string
+      size_str, args = next_args(args, &parsed)
+      size := strings.split(size_str, "x", context.temp_allocator)
+      if len(size) != 2 do return false
+      prog.scaled_size = {
+        strconv.parse_uint(size[0]) or_return,
+        strconv.parse_uint(size[1]) or_return,
       }
 
     case "-o":
@@ -109,19 +115,20 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
 }
 
 Pixel :: distinct [4]byte
-Pixels :: distinct [dynamic]Pixel
+Pixels :: distinct []Pixel
 
 Prog :: struct {
   img:           ^png.Image,
   img_path:      string,
   pixels:        Pixels,
+  scaled_size:   [2]uint,
   /**/
   char_gradient: string,
-  scale:         [2]uint,
+  scale:         [2]f32,
   output_path:   string,
 }
 
-prog_init :: proc(using prog: ^Prog) {
+prog_init :: proc(using self: ^Prog) {
   char_gradient = DEFAULT_CHAR_GRADIENT
   scale = {1, 1}
 }
@@ -152,7 +159,10 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
     return false
   }
 
-  pixels = make(Pixels, 0, img.width * img.height)
+  if scaled_size == 0 {
+    scaled_size = {uint(f32(img.width) * scale.x), uint(f32(img.height) * scale.y)}
+  }
+  pixels = make(Pixels, scaled_size.x * scaled_size.y)
 
   return true
 }
@@ -160,24 +170,55 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
 read_image :: proc(using prog: ^Prog) {
   defer free_all(context.temp_allocator)
 
-  err: io.Error
-  for err == nil {
-    pixel := Pixel{}
+  scaled_img_buf := scale_image(img, scaled_size, context.temp_allocator)
 
-    for i in 0 ..< img.channels {
-      pixel[i], err = bytes.buffer_read_byte(&img.pixels)
+  for &pixel, i in pixels {
+    for j in 0 ..< img.channels {
+      pixel[j] = scaled_img_buf[i * img.channels + j]
     }
-    if img.pixels.off == 0 do break
-    append(&pixels, pixel)
   }
 }
 
-print_pixel_hex :: proc(pixel: Pixel) {
-  fmt.print("#")
-  for i in 0 ..< len(pixel) {
-    fmt.printf("%X", pixel[i])
+// https://web.archive.org/web/20170809062128/http://willperone.net/Code/codescaling.php
+scale_image :: proc(
+  input: ^png.Image,
+  scaled_size: [2]uint,
+  allocator := context.allocator,
+) -> []byte {
+  assert(input.channels == 3 || input.channels == 4)
+  old_size := [2]int{input.width, input.height}
+  new_size := [2]int{int(scaled_size.x), int(scaled_size.y)}
+  input_buf := input.pixels.buf
+  output_buf := make([]byte, new_size.x * new_size.y * input.channels, allocator)
+
+  yd := int((old_size.y / new_size.y) * old_size.x - old_size.x)
+  yr := old_size.y % new_size.y
+  xd := int(old_size.x / new_size.x)
+  xr := old_size.x % new_size.x
+  in_off, out_off: int
+
+  for y, ye := new_size.y, 0; y > 0; y -= 1 {
+    for x, xe := new_size.x, 0; x > 0; x -= 1 {
+      for i in 0 ..< input.channels {
+        output_buf[out_off + i] = input_buf[in_off + i]
+      }
+      out_off += input.channels
+      in_off += xd * input.channels
+      xe += xr
+      if (xe >= new_size.x) {
+        xe -= new_size.x
+        in_off += input.channels
+      }
+    }
+    in_off += yd * input.channels
+    ye += yr
+    if (ye >= new_size.y) {
+      ye -= new_size.y
+      in_off += old_size.x * input.channels
+    }
   }
-  fmt.println()
+
+  return output_buf
 }
 
 get_lum :: proc(pixel: Pixel) -> byte {
@@ -204,15 +245,11 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   }
   defer c.fclose(file)
 
-  for y in 0 ..< img.height {
-    for _ in 0 ..< scale.y {
-      for x in 0 ..< img.width {
-        for _ in 0 ..< scale.x {
-          c.fprintf(file, "%c", pixel_to_ascii(pixels[x + img.width * y], char_gradient))
-        }
-      }
-      c.fprintf(file, "\n")
+  for y in 0 ..< scaled_size.y {
+    for x in 0 ..< scaled_size.x {
+      c.fprintf(file, "%c", pixel_to_ascii(pixels[x + scaled_size.x * y], char_gradient))
     }
+    c.fprintf(file, "\n")
   }
 
   return true
