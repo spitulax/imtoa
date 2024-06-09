@@ -36,16 +36,28 @@ start :: proc() -> (ok: bool) {
     return false
   }
 
-  load_image(&prog) or_return
-  read_image(&prog)
-  write_txt(&prog) or_return
+  if !prog.view {
+    load_image(&prog) or_return
+    read_image(&prog)
+    write_txt(&prog) or_return
+  } else {
+    unimplemented()
+  }
 
   return true
 }
 
 usage :: proc() {
   fmt.eprintfln(
-    "Usage: %v <image.png> [-g <char_gradient>] [-s <hscale:vscale> | -S <WxH>] [-o <output_path>] [--plain]",
+    `Usage: %v <convert <image.png>|view <image.aim>|--help|--version> [options]...
+Options (convert):
+    -g <char_gradient>
+    -s <hscale:vscale>
+    -S <WxH> (overrides -s)
+    -o <output_path>
+    --plain (convert to plain .txt file instead of compressed .aim file)
+Options (view):
+    -e <editor> (defaults to $EDITOR)`,
     PROG_NAME,
   )
 }
@@ -53,7 +65,10 @@ usage :: proc() {
 parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   next_args :: proc(args: ^[]string, parsed: ^int = nil) -> string {
     args := args
-    if len(args^) <= 0 do return ""
+    if len(args^) <= 0 {
+      args^ = nil
+      return ""
+    }
     if parsed != nil do parsed^ += 1
     curr := args[0]
     args^ = args[1:]
@@ -69,43 +84,61 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   switch meta_arg {
   case "-h", "--help":
     return false
+  case "-v", "--version":
+    fmt.printfln("%v v%v", PROG_NAME, PROG_VERSION)
+    return false
+  case "convert":
+    prog.img_path = next_args(&args, &parsed)
+  case "view":
+    prog.view = true
+    prog.img_path = next_args(&args, &parsed)
   case:
-    prog.img_path = meta_arg
+    return false
   }
+  if args == nil do return false
 
   for len(args) > 0 {
     arg: string
     arg = next_args(&args)
 
-    switch arg {
-    case "-g":
-      prog.char_gradient = next_args(&args, &parsed)
+    if !prog.view {
+      switch arg {
+      case "-g":
+        prog.char_gradient = next_args(&args, &parsed)
 
-    case "-s":
-      scale_str: string
-      scale_str = next_args(&args, &parsed)
-      scale := strings.split(scale_str, ":", context.temp_allocator)
-      if len(scale) != 2 do return false
-      prog.scale = {strconv.parse_f32(scale[0]) or_return, strconv.parse_f32(scale[1]) or_return}
+      case "-s":
+        scale_str: string
+        scale_str = next_args(&args, &parsed)
+        scale := strings.split(scale_str, ":", context.temp_allocator)
+        if len(scale) != 2 do return false
+        prog.scale = {strconv.parse_f32(scale[0]) or_return, strconv.parse_f32(scale[1]) or_return}
 
-    case "-S":
-      size_str: string
-      size_str = next_args(&args, &parsed)
-      size := strings.split(size_str, "x", context.temp_allocator)
-      if len(size) != 2 do return false
-      prog.scaled_size = {
-        strconv.parse_uint(size[0]) or_return,
-        strconv.parse_uint(size[1]) or_return,
+      case "-S":
+        size_str: string
+        size_str = next_args(&args, &parsed)
+        size := strings.split(size_str, "x", context.temp_allocator)
+        if len(size) != 2 do return false
+        prog.scaled_size = {
+          strconv.parse_uint(size[0]) or_return,
+          strconv.parse_uint(size[1]) or_return,
+        }
+
+      case "-o":
+        prog.output_path = next_args(&args, &parsed)
+
+      case "--plain":
+        prog.plain = true
+
+      case:
+        parsed -= 1
       }
-
-    case "-o":
-      prog.output_path = next_args(&args, &parsed)
-
-    case "--plain":
-      prog.plain = true
-
-    case:
-      parsed -= 1
+    } else {
+      switch arg {
+      case "-e":
+        prog.editor = next_args(&args, &parsed)
+      case:
+        parsed -= 1
+      }
     }
 
     if args != nil {
@@ -142,6 +175,8 @@ Prog :: struct {
   scale:         [2]f32,
   output_path:   string,
   plain:         bool,
+  view:          bool, // view a .aim file instead of converting from .png image
+  editor:        string,
 }
 
 prog_init :: proc(using self: ^Prog) {
@@ -184,7 +219,12 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
 }
 
 read_image :: proc(using prog: ^Prog) {
-  scaled_img_buf := scale_image(img, scaled_size, context.temp_allocator)
+  scaled_img_buf: []byte
+  if scale == {1, 1} {
+    scaled_img_buf = img.pixels.buf[:]
+  } else {
+    scaled_img_buf = scale_image(img, scaled_size, context.temp_allocator)
+  }
 
   for &pixel, i in pixels {
     for j in 0 ..< img.channels {
