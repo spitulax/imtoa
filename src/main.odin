@@ -5,6 +5,7 @@ import pq "core:container/priority_queue"
 import "core:fmt"
 import "core:image"
 import "core:image/png"
+import "core:math"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
@@ -20,6 +21,7 @@ AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x55\x52\x4d\x4f\x4d"
 //DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
 //DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 // TODO: variable gradient steps
+// TODO: check if gradient only contains ASCII chars
 DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 
 main :: proc() {
@@ -151,6 +153,12 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   if len(prog.char_gradient) != 16 {
     fmt.eprintln("Char gradient's length is not 16 characters")
     return false
+  }
+  for char in prog.char_gradient {
+    if char == 0 {
+      fmt.eprintln("NUL byte is not allowed in char gradient")
+      return false
+    }
   }
   // how can you come up with >255 unique ASCII chars anyway?
   // but char_gradient could contain duplicate chars
@@ -292,12 +300,6 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
       context.temp_allocator,
     )
 
-  text := make([]byte, scaled_size.x * scaled_size.y)
-  for &char, i in text {
-    char = pixel_to_ascii(pixels[i], char_gradient)
-  }
-  defer delete(text)
-
   // NOTE: using libc is faster than os.open for some reason
   file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
   if file == nil {
@@ -306,19 +308,40 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   }
   defer c.fclose(file)
 
-  if plain do write_plain_txt(prog, file, text) or_return
-  else do write_compressed_txt(prog, file, text) or_return
+  if plain do write_plain_txt(prog, file) or_return
+  else do write_compressed_txt(prog, file) or_return
 
   return true
 }
 
-write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: bool) {
+write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   arena: virtual.Arena
   assert(virtual.arena_init_growing(&arena) == nil)
   defer virtual.arena_destroy(&arena)
   arena_alloc := virtual.arena_allocator(&arena)
-
   context.allocator = arena_alloc
+
+  // compress repeated chars to one char with prefix indicating number of repeats
+  // the MSB indicates that a byte is an ASCII char if 0 or a repeat count if 1
+  // NOTE: each unique repeat count acts has its own encoded value
+  // TODO: maybe compress repeating pattern of >1 chars
+  text := make([dynamic]byte, 0, scaled_size.x * scaled_size.y)
+  repeats: byte = 1
+  prev_char: byte
+  for i in 0 ..< scaled_size.x * scaled_size.y - 1 {
+    curr_char := pixel_to_ascii(pixels[i], char_gradient)
+    assert(curr_char != 0)
+    if repeats < byte(math.pow(f32(2), 7)) - 1 && curr_char == prev_char {   // 7: remaining bits, 1 bits are used for indication
+      repeats += 1
+    } else if i >= 1 {
+      if repeats > 1 {
+        append(&text, repeats | 0b10000000)
+      }
+      append(&text, prev_char)
+      repeats = 1
+    }
+    prev_char = curr_char
+  }
 
   char_freq := make(map[byte]uint, len(char_gradient))
   for char in char_gradient {
@@ -334,16 +357,16 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> 
 
   // magic number
   c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
-  // stride, [ascii_digit:1]... [0x00]
-  c.fprintf(file, "%zu", scaled_size.x)
-  c.fprintf(file, "%c", 0)
-  // number of unique chars (8-bit integer), [int:1]
-  assert(len(char_gradient) < 256)
-  c.fprintf(file, "%c", byte(len(char_gradient)))
+  // stride (u32), [u32:4]
+  stride := u32(scaled_size.x)
+  c.fwrite(&stride, 1, 4, file)
+  // number of unique chars + repeat counts (u8), [u8:1]
+  huffman_code_len := u8(len(huffman_codes))
+  c.fwrite(&huffman_code_len, 1, 1, file)
   // lookup table, [char:1] [huffman_code_len:1] [encoded_value:len(v)]
   for k, &v in huffman_codes {
     // print the huffman codes for debugging
-    //fmt.printfln("'%c': %v", k, v)
+    //print_codes(k, &v)
 
     if len(v) >= 256 {
       fmt.eprintln("The gradient is too detailed!")
@@ -374,7 +397,13 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> 
   return true
 }
 
-write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE, text: []byte) -> (ok: bool) {
+write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
+  text := make([]byte, scaled_size.x * scaled_size.y)
+  for &char, i in text {
+    char = pixel_to_ascii(pixels[i], char_gradient)
+  }
+  defer delete(text)
+
   for y in 0 ..< scaled_size.y {
     for x in 0 ..< scaled_size.x {
       c.fprintf(file, "%c", text[x + scaled_size.x * y])
@@ -460,5 +489,13 @@ huffman_extract_code :: proc(
   }
   huffman_extract_code(root.left, output, allocator, left_str)
   huffman_extract_code(root.right, output, allocator, right_str)
+}
+
+print_codes :: proc(k: byte, v: ^string) {
+  if k & 0b10000000 == 0 {
+    fmt.printfln("'%c': %v", k, v^)
+  } else {
+    fmt.printfln("%v: %v", k & 0b01111111, v^)
+  }
 }
 
