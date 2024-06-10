@@ -12,7 +12,6 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
-import "core:unicode/utf8"
 
 PROG_NAME :: #config(PROG_NAME, "")
 PROG_VERSION :: #config(PROG_VERSION, "")
@@ -24,6 +23,10 @@ AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x55\x52\x4d\x4f\x4d"
 // TODO: variable gradient steps
 // TODO: check if gradient only contains ASCII chars (https://pkg.odin-lang.org/core/strings/#ascii_set_contains)
 DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
+
+Pixel :: distinct [4]byte
+Pixels :: distinct []Pixel
+Bits :: distinct []bool
 
 main :: proc() {
   if !start() do os.exit(1)
@@ -182,9 +185,6 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   return true
 }
 
-Pixel :: distinct [4]byte
-Pixels :: distinct []Pixel
-
 Prog :: struct {
   img:           ^png.Image,
   img_path:      string,
@@ -308,7 +308,7 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
     output_path != "" \
     ? output_path \
     : strings.concatenate(
-      {filepath.stem(img_path), !plain ? ".aim" : ".txt"},
+      {filepath.stem(img_path), (!plain ? ".aim" : ".txt")},
       context.temp_allocator,
     )
 
@@ -364,7 +364,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   }
 
   huffman_tree := huffman_encode(char_freq)
-  huffman_codes := make(map[byte]string)
+  huffman_codes := make(map[byte]Bits)
   huffman_extract_code(huffman_tree, &huffman_codes)
 
   // magic number (8 bytes)
@@ -395,11 +395,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   // actual data, (huffman_codes)...
   encoded_text := make([dynamic]byte, 0, len(text))
   for &char in text {
-    huffman_code := utf8.string_to_runes(huffman_codes[char])
-    for &rune in huffman_code {
-      encoded_rune, _ := utf8.encode_rune(rune)
-      append(&encoded_text, encoded_rune[0])
-    }
+    append_string(&encoded_text, bits_to_str(huffman_codes[char]))
   }
   whole_bytes := parse_binary(strings.clone_from_bytes(encoded_text[:], context.temp_allocator))
   for &byte in whole_bytes {
@@ -483,7 +479,21 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
   return .None
 }
 
-bits_to_str :: proc(bits: []byte, len: uint, allocator := context.allocator) -> string {
+bits_to_str :: proc {
+  bits_to_str_small_array,
+  bits_to_str_slice,
+}
+
+bits_to_str_small_array :: proc(bits: Bits, allocator := context.allocator) -> string {
+  sb: strings.Builder
+  strings.builder_init(&sb)
+  for i in 0 ..< len(bits) {
+    strings.write_rune(&sb, bits[i] ? '1' : '0')
+  }
+  return strings.to_string(sb)
+}
+
+bits_to_str_slice :: proc(bits: []byte, len: uint, allocator := context.allocator) -> string {
   sb: strings.Builder
   strings.builder_init(&sb, allocator)
   for i in 0 ..< len {
@@ -508,9 +518,22 @@ consume_file_reinterpret :: proc(buf: ^[]byte, $T: typeid) -> (result: T, err: A
 }
 
 // big-endian
-parse_binary :: proc(str: string, allocator := context.allocator) -> []byte {
-  acc := make([]byte, (len(str) + 8 - 1) / 8, allocator)
-  for c, i in str {
+parse_binary :: proc {
+  parse_binary_string,
+  parse_binary_small_array,
+}
+
+parse_binary_small_array :: proc(bits: Bits, allocator := context.allocator) -> []byte {
+  acc := make([]byte, (len(bits) + 8 - 1) / 8, allocator)
+  for i in 0 ..< len(bits) {
+    acc[i / 8] |= byte(bits[i] ? 0x80 : 0x00) >> (uint(i) % 8)
+  }
+  return acc
+}
+
+parse_binary_string :: proc(bits: string, allocator := context.allocator) -> []byte {
+  acc := make([]byte, (len(bits) + 8 - 1) / 8, allocator)
+  for c, i in bits {
     switch c {
     case '0':
       acc[i / 8] |= byte(0x00) >> (uint(i) % 8)
@@ -565,31 +588,37 @@ huffman_encode :: proc(data: map[byte]uint, allocator := context.allocator) -> ^
   return pq.pop(&min_heap)
 }
 
+@(optimization_mode = "speed")
 huffman_extract_code :: proc(
   root: ^HuffmanNode,
-  output: ^map[byte]string,
+  output: ^map[byte]Bits,
   allocator := context.allocator,
-  trail: string = "",
+  trail: Bits = nil,
+  count: uint = 0,
 ) {
-  if root == nil do return
+  assert(root != nil)
   if root.data != 0 {
-    output[root.data] = fmt.aprint(trail, allocator = allocator)
+    output[root.data] = new_clone(trail, allocator)^
+  } else {
+    left_trail := make(Bits, count + 1)
+    right_trail := make(Bits, count + 1)
+    copy(left_trail, trail)
+    copy(right_trail, trail)
+    left_trail[count] = false
+    right_trail[count] = true
+    huffman_extract_code(root.left, output, allocator, left_trail, count + 1)
+    huffman_extract_code(root.right, output, allocator, right_trail, count + 1)
+    delete(left_trail)
+    delete(right_trail)
+    strings.write_rune()
   }
-  left_str := fmt.aprint(trail, "0", sep = "", allocator = allocator)
-  right_str := fmt.aprint(trail, "1", sep = "", allocator = allocator)
-  defer {
-    delete(left_str)
-    delete(right_str)
-  }
-  huffman_extract_code(root.left, output, allocator, left_str)
-  huffman_extract_code(root.right, output, allocator, right_str)
 }
 
-print_codes :: proc(k: byte, v: ^string) {
+print_codes :: proc(k: byte, v: ^Bits) {
   if k & 0b10000000 == 0 {
-    fmt.printfln("'%c': %v", k, v^)
+    fmt.printfln("'%c': %v", k, bits_to_str(v^, context.temp_allocator))
   } else {
-    fmt.printfln("%v: %v", k & 0b01111111, v^)
+    fmt.printfln("%v: %v", k & 0b01111111, bits_to_str(v^, context.temp_allocator))
   }
 }
 
