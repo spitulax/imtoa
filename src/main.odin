@@ -1,11 +1,12 @@
 package imtoa
 
+import "base:intrinsics"
 import c "core:c/libc"
 import pq "core:container/priority_queue"
 import "core:fmt"
 import "core:image"
 import "core:image/png"
-import "core:math"
+import "core:math/bits"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
@@ -21,7 +22,7 @@ AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x55\x52\x4d\x4f\x4d"
 //DEFAULT_CHAR_GRADIENT :: " .,:=nml?JUOM&W#"
 //DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 // TODO: variable gradient steps
-// TODO: check if gradient only contains ASCII chars
+// TODO: check if gradient only contains ASCII chars (https://pkg.odin-lang.org/core/strings/#ascii_set_contains)
 DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 
 main :: proc() {
@@ -31,7 +32,7 @@ main :: proc() {
 start :: proc() -> (ok: bool) {
   prog := Prog{}
   prog_init(&prog)
-  defer prog_deinit(&prog)
+  defer prog_destroy(&prog)
 
   if !parse_args(&prog) {
     usage()
@@ -43,7 +44,18 @@ start :: proc() -> (ok: bool) {
     read_image(&prog)
     write_txt(&prog) or_return
   } else {
-    unimplemented()
+    err := view_aim(&prog)
+    switch err {
+    case .None:
+      return true
+    case .Cannot_Read_File:
+      fmt.eprintfln("Failed to read %s", prog.img_path)
+    case .Unexpected_EOF:
+      fmt.eprintfln("Encountered unexpected EOF when reading %s", prog.img_path)
+    case .Invalid_File:
+      fmt.eprintfln("%s is not a valid .aim file", prog.img_path)
+    }
+    return false
   }
 
   return true
@@ -192,7 +204,7 @@ prog_init :: proc(using self: ^Prog) {
   scale = {1, 1}
 }
 
-prog_deinit :: proc(using self: ^Prog) {
+prog_destroy :: proc(using self: ^Prog) {
   png.destroy(img)
   delete(pixels)
 }
@@ -331,7 +343,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   for i in 0 ..< scaled_size.x * scaled_size.y - 1 {
     curr_char := pixel_to_ascii(pixels[i], char_gradient)
     assert(curr_char != 0)
-    if repeats < byte(math.pow(f32(2), 7)) - 1 && curr_char == prev_char {   // 7: remaining bits, 1 bits are used for indication
+    if repeats < byte(1 << 7 - 1) - 1 && curr_char == prev_char {   // 7: remaining bits, 1 bits are used for indication
       repeats += 1
     } else if i >= 1 {
       if repeats > 1 {
@@ -355,15 +367,15 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   huffman_codes := make(map[byte]string)
   huffman_extract_code(huffman_tree, &huffman_codes)
 
-  // magic number
+  // magic number (8 bytes)
   c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
-  // stride (u32), [u32:4]
-  stride := u32(scaled_size.x)
+  // stride (u32le, 4 bytes)
+  stride := bits.to_le_u32(u32(scaled_size.x))
   c.fwrite(&stride, 1, 4, file)
-  // number of unique chars + repeat counts (u8), [u8:1]
+  // number of unique chars + repeat counts (u8, 1 byte)
   huffman_code_len := u8(len(huffman_codes))
   c.fwrite(&huffman_code_len, 1, 1, file)
-  // lookup table, [char:1] [huffman_code_len:1] [encoded_value:len(v)]
+  // lookup table: (k, 1 byte) (huffman_code_len, 1 byte) (huffman_code, <huffman_code_len> bits)
   for k, &v in huffman_codes {
     // print the huffman codes for debugging
     //print_codes(k, &v)
@@ -380,7 +392,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
       c.fprintf(file, "%c", b)
     }
   }
-  // actual data, [huffman_codes:variable]
+  // actual data, (huffman_codes)...
   encoded_text := make([dynamic]byte, 0, len(text))
   for &char in text {
     huffman_code := utf8.string_to_runes(huffman_codes[char])
@@ -413,6 +425,88 @@ write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   return true
 }
 
+Aim_Error :: enum u8 {
+  None             = 0,
+  Cannot_Read_File = 1,
+  Invalid_File     = 2,
+  Unexpected_EOF   = 3,
+}
+
+Aim_Image :: struct {
+  stride:        u32,
+  unique_bytes:  u8,
+  huffman_codes: map[byte]string,
+}
+
+aim_image_init :: proc(using self: ^Aim_Image) {
+  huffman_codes = make(map[byte]string)
+}
+
+aim_image_destroy :: proc(using self: ^Aim_Image) {
+  delete(huffman_codes)
+}
+
+view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
+  file_data, ok := os.read_entire_file(img_path)
+  if !ok do return .Cannot_Read_File
+  defer delete(file_data)
+
+  file := file_data
+
+  signature := consume_file(&file, len(AIM_MAGIC_NUMBER)) or_return
+  if strings.clone_from_bytes(signature, context.temp_allocator) != AIM_MAGIC_NUMBER do return .Invalid_File
+
+  aim_image := Aim_Image{}
+  aim_image_init(&aim_image)
+  defer aim_image_destroy(&aim_image)
+
+  aim_image.stride = bits.from_le_u32(consume_file_reinterpret(&file, u32) or_return)
+  aim_image.unique_bytes = consume_file_reinterpret(&file, u8) or_return
+
+  for _ in 0 ..< aim_image.unique_bytes {
+    key := consume_file_reinterpret(&file, byte) or_return
+    length_bits := consume_file_reinterpret(&file, byte) or_return
+    length_bytes := (length_bits + 8 - 1) / 8
+    value := consume_file(&file, uint(length_bytes)) or_return
+    value_str := bits_to_str(value, uint(length_bits), context.temp_allocator)
+    aim_image.huffman_codes[key] = value_str
+  }
+
+  if aim_image.stride <= 0 ||
+     aim_image.unique_bytes <= 0 ||
+     byte(len(aim_image.huffman_codes)) != aim_image.unique_bytes {
+    return .Invalid_File
+  }
+
+  //fmt.printfln("%#v", aim_image)
+
+  return .None
+}
+
+bits_to_str :: proc(bits: []byte, len: uint, allocator := context.allocator) -> string {
+  sb: strings.Builder
+  strings.builder_init(&sb, allocator)
+  for i in 0 ..< len {
+    byte := bits[i / 8]
+    bit := bool(byte & (0b10000000 >> uint(i % 8)))
+    strings.write_rune(&sb, bit ? '1' : '0')
+  }
+  return strings.to_string(sb)
+}
+
+consume_file :: proc(buf: ^[]byte, length: uint) -> (result: []byte, err: Aim_Error) {
+  buf := buf
+  if uint(len(buf^)) - length < 0 || length == 0 do return nil, .Unexpected_EOF
+  result = buf[:length]
+  buf^ = buf[length:]
+  return result, .None
+}
+
+// what the hell is this? https://github.com/odin-lang/Odin/blob/master/core/encoding/endian/endian.odin
+consume_file_reinterpret :: proc(buf: ^[]byte, $T: typeid) -> (result: T, err: Aim_Error) {
+  return intrinsics.unaligned_load((^T)(raw_data(consume_file(buf, size_of(T)) or_return))), .None
+}
+
 // big-endian
 parse_binary :: proc(str: string, allocator := context.allocator) -> []byte {
   acc := make([]byte, (len(str) + 8 - 1) / 8, allocator)
@@ -423,7 +517,7 @@ parse_binary :: proc(str: string, allocator := context.allocator) -> []byte {
     case '1':
       acc[i / 8] |= byte(0x80) >> (uint(i) % 8)
     case 0x00:
-      continue
+      break
     case:
       return nil
     }
