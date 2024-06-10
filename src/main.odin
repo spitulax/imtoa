@@ -610,7 +610,6 @@ huffman_extract_code :: proc(
     huffman_extract_code(root.right, output, allocator, right_trail, count + 1)
     delete(left_trail)
     delete(right_trail)
-    strings.write_rune()
   }
 }
 
