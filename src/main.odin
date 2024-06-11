@@ -254,6 +254,7 @@ read_image :: proc(using prog: ^Prog) {
 }
 
 // https://web.archive.org/web/20170809062128/http://willperone.net/Code/codescaling.php
+@(optimization_mode = "speed")
 scale_image :: proc(
   input: ^png.Image,
   scaled_size: [2]uint,
@@ -393,12 +394,14 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
     }
   }
   // actual data, (huffman_codes)...
-  encoded_text := make([dynamic]byte, 0, len(text))
-  for &char in text {
-    append_string(&encoded_text, bits_to_str(huffman_codes[char]))
+  encoded_bits := make([dynamic]bool, 0, len(text))
+  for char in text {
+    for bit in huffman_codes[char] {
+      append(&encoded_bits, bit)
+    }
   }
-  whole_bytes := parse_binary(strings.clone_from_bytes(encoded_text[:], context.temp_allocator))
-  for &byte in whole_bytes {
+  whole_bytes := parse_binary(Bits(encoded_bits[:]), context.temp_allocator)
+  for byte in whole_bytes {
     c.fprintf(file, "%c", byte)
   }
 
@@ -474,7 +477,7 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
     return .Invalid_File
   }
 
-  //fmt.printfln("%#v", aim_image)
+  fmt.printfln("%#v", aim_image)
 
   return .None
 }
@@ -518,32 +521,10 @@ consume_file_reinterpret :: proc(buf: ^[]byte, $T: typeid) -> (result: T, err: A
 }
 
 // big-endian
-parse_binary :: proc {
-  parse_binary_string,
-  parse_binary_small_array,
-}
-
-parse_binary_small_array :: proc(bits: Bits, allocator := context.allocator) -> []byte {
+parse_binary :: proc(bits: Bits, allocator := context.allocator) -> []byte {
   acc := make([]byte, (len(bits) + 8 - 1) / 8, allocator)
   for i in 0 ..< len(bits) {
     acc[i / 8] |= byte(bits[i] ? 0x80 : 0x00) >> (uint(i) % 8)
-  }
-  return acc
-}
-
-parse_binary_string :: proc(bits: string, allocator := context.allocator) -> []byte {
-  acc := make([]byte, (len(bits) + 8 - 1) / 8, allocator)
-  for c, i in bits {
-    switch c {
-    case '0':
-      acc[i / 8] |= byte(0x00) >> (uint(i) % 8)
-    case '1':
-      acc[i / 8] |= byte(0x80) >> (uint(i) % 8)
-    case 0x00:
-      break
-    case:
-      return nil
-    }
   }
   return acc
 }
@@ -600,16 +581,16 @@ huffman_extract_code :: proc(
   if root.data != 0 {
     output[root.data] = new_clone(trail, allocator)^
   } else {
-    left_trail := make(Bits, count + 1)
-    right_trail := make(Bits, count + 1)
+    next_trails := make(Bits, count * 2 + 2)
+    left_trail := next_trails[:count + 1]
+    right_trail := next_trails[count + 1:]
     copy(left_trail, trail)
     copy(right_trail, trail)
     left_trail[count] = false
     right_trail[count] = true
     huffman_extract_code(root.left, output, allocator, left_trail, count + 1)
     huffman_extract_code(root.right, output, allocator, right_trail, count + 1)
-    delete(left_trail)
-    delete(right_trail)
+    delete(next_trails)
   }
 }
 
