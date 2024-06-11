@@ -7,6 +7,7 @@ import "core:fmt"
 import "core:image"
 import "core:image/png"
 import "core:math/bits"
+import "core:mem"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
@@ -29,6 +30,29 @@ Pixels :: distinct []Pixel
 Bits :: distinct []bool
 
 main :: proc() {
+  when ODIN_DEBUG {
+    mem_track: mem.Tracking_Allocator
+    mem.tracking_allocator_init(&mem_track, context.allocator)
+    context.allocator = mem.tracking_allocator(&mem_track)
+    defer {
+      if len(mem_track.allocation_map) > 0 {
+        fmt.eprintfln("### %v unfreed allocations ###", len(mem_track.allocation_map))
+        for _, v in mem_track.allocation_map {
+          fmt.eprintfln("    %v bytes in %v", v.size, v.location)
+        }
+      }
+      if len(mem_track.bad_free_array) > 0 {
+        fmt.eprintfln("### %v bad frees ###", len(mem_track.bad_free_array))
+        for x in mem_track.bad_free_array {
+          fmt.eprintfln("    %p in %v", x.memory, x.location)
+        }
+      }
+      mem.tracking_allocator_destroy(&mem_track)
+    }
+  } else {
+    // suppress vet (unused import "core:mem")
+    _ = mem.Byte
+  }
   if !start() do os.exit(1)
 }
 
@@ -146,6 +170,13 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       case "--plain":
         prog.plain = true
 
+      case "--debug":
+        when ODIN_DEBUG {
+          prog.debug = true
+        } else {
+          fallthrough
+        }
+
       case:
         parsed -= 1
       }
@@ -197,6 +228,7 @@ Prog :: struct {
   plain:         bool,
   view:          bool, // view a .aim file instead of converting from .png image
   editor:        string,
+  debug:         bool,
 }
 
 prog_init :: proc(using self: ^Prog) {
@@ -378,8 +410,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   c.fwrite(&huffman_code_len, 1, 1, file)
   // lookup table: (k, 1 byte) (huffman_code_len, 1 byte) (huffman_code, <huffman_code_len> bits)
   for k, &v in huffman_codes {
-    // print the huffman codes for debugging
-    //print_codes(k, &v)
+    if debug do print_codes(k, &v)
 
     if len(v) >= 256 {
       fmt.eprintln("The gradient is too detailed!")
@@ -476,8 +507,6 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
      byte(len(aim_image.huffman_codes)) != aim_image.unique_bytes {
     return .Invalid_File
   }
-
-  fmt.printfln("%#v", aim_image)
 
   return .None
 }
