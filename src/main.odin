@@ -12,6 +12,7 @@ import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
+import "core:sort"
 import "core:strconv"
 import "core:strings"
 
@@ -610,7 +611,7 @@ view_aim :: proc(using prog: Prog) -> (err: Aim_Error) {
       }
       if c.system(rm_cmd) != 0 {
         fmt.eprint("\033[1;33m")
-        fmt.eprintfln("WARNING: Failed to remove temporary file")
+        fmt.eprintfln("[WARNING] Failed to remove temporary file")
         fmt.eprint("\033[0m")
       }
     }
@@ -747,18 +748,39 @@ huffman_extract_code :: proc(
   }
 }
 
+// FIXME: sloooow
 @(optimization_mode = "speed")
 huffman_decode :: proc(
   codes_map: map[byte]Bits,
   data: Bits,
   allocator := context.allocator,
-) -> []byte {
+) -> []byte #no_bounds_check {
   result := make([dynamic]byte, 0, len(data) / 8, allocator)
 
   min_len: int = max(int)
   for _, v in codes_map {
     min_len = min(len(v), min_len)
   }
+
+  map_entries, _ := slice.map_entries(codes_map)
+  defer delete(map_entries)
+
+  map_entry_sort := sort.Interface {
+    collection = rawptr(&map_entries),
+    len = proc(it: sort.Interface) -> int {
+      s := (^[]slice.Map_Entry(byte, Bits))(it.collection)
+      return len(s^)
+    },
+    less = proc(it: sort.Interface, i, j: int) -> bool {
+      s := (^[]slice.Map_Entry(byte, Bits))(it.collection)
+      return len(s[i].value) < len(s[j].value)
+    },
+    swap = proc(it: sort.Interface, i, j: int) {
+      s := (^[]slice.Map_Entry(byte, Bits))(it.collection)
+      s[i], s[j] = s[j], s[i]
+    },
+  }
+  sort.sort(map_entry_sort)
 
   buf := make([dynamic]bool)
   defer delete(buf)
@@ -768,9 +790,9 @@ huffman_decode :: proc(
     if len(buf) < min_len && bit != nil {
       append(&buf, bit^)
     } else {
-      for k, v in codes_map {
-        if slice.simple_equal(v, buf[:]) {
-          append(&result, k)
+      for v in map_entries {
+        if slice.simple_equal(v.value, buf[:]) {
+          append(&result, v.key)
           clear(&buf)
           break
         }
