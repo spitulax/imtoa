@@ -593,7 +593,8 @@ view_aim :: proc(using prog: Prog) -> (err: Aim_Error) {
   // FIXME: -e is broken
   //        the end part of the temp file is weirldy missing but the file written using the above fprintf is fine
   if editor != "" {
-    tmp_file_path := fmt.ctprintf(".#%s#imtoa", img_path)
+    tmp_file_path_str, _ := strings.replace_all(img_path, "/", "_", context.temp_allocator)
+    tmp_file_path := fmt.ctprintf(".#%s#imtoa", tmp_file_path_str)
     tmp_file := c.fopen(tmp_file_path, "w")
     if tmp_file == nil {
       fmt.eprintln("Failed to create temporary file")
