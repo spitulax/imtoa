@@ -11,6 +11,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 
@@ -25,11 +26,37 @@ AIM_MAGIC_NUMBER :: "\x4e\x4f\x54\x55\x52\x4d\x4f\x4d"
 // TODO: check if gradient only contains ASCII chars (https://pkg.odin-lang.org/core/strings/#ascii_set_contains)
 DEFAULT_CHAR_GRADIENT :: " .-:iuom?lO0WM%#"
 
-Pixel :: distinct [4]byte
-Pixels :: distinct []Pixel
-Bits :: distinct []bool
+Pixel :: [4]byte
+Pixels :: []Pixel
+Bits :: []bool
+
+Prog :: struct {
+  img:           ^png.Image,
+  img_path:      string,
+  pixels:        Pixels,
+  scaled_size:   [2]uint,
+  /**/
+  char_gradient: string,
+  scale:         [2]f32,
+  output_path:   string,
+  plain:         bool,
+  view:          bool, // view a .aim file instead of converting from .png image
+  editor:        string,
+  debug:         bool,
+}
+
+prog_init :: proc(using self: ^Prog) {
+  char_gradient = DEFAULT_CHAR_GRADIENT
+  scale = {1, 1}
+}
+
+prog_destroy :: proc(using self: ^Prog) {
+  png.destroy(img)
+  delete(pixels)
+}
 
 main :: proc() {
+  defer free_all(context.temp_allocator)
   when ODIN_DEBUG {
     mem_track: mem.Tracking_Allocator
     mem.tracking_allocator_init(&mem_track, context.allocator)
@@ -81,6 +108,8 @@ start :: proc() -> (ok: bool) {
       fmt.eprintfln("Encountered unexpected EOF when reading %s", prog.img_path)
     case .Invalid_File:
       fmt.eprintfln("%s is not a valid .aim file", prog.img_path)
+    case .Cannot_View:
+      fmt.eprintfln("Decoded %s but failed to view it", prog.img_path)
     }
     return false
   }
@@ -92,13 +121,14 @@ usage :: proc() {
   fmt.eprintfln(
     `Usage: %v <convert <image.png>|view <image.aim>|--help|--version> [options]...
 Options (convert):
-    -g <char_gradient>
-    -s <hscale:vscale>
-    -S <WxH> (overrides -s)
-    -o <output_path>
-    --plain (convert to plain .txt file instead of compressed .aim file)
+    -g <char_gradient>      The gradient palette
+    -s <hscale:vscale>      The scale to the original resolution
+    -S <WxH>                The resolution (overrides -s)
+    -o <output_path>        The output path
+    --plain                 Convert to plain .txt file
 Options (view):
-    -e <editor> (defaults to $EDITOR)`,
+    -o <output_path>        The output path as .txt file
+    -e <editor>             The text editor to view the image`,
     PROG_NAME,
   )
 }
@@ -139,8 +169,7 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   if args == nil do return false
 
   for len(args) > 0 {
-    arg: string
-    arg = next_args(&args)
+    arg := next_args(&args)
 
     if !prog.view {
       switch arg {
@@ -184,6 +213,17 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
       switch arg {
       case "-e":
         prog.editor = next_args(&args, &parsed)
+
+      case "-o":
+        prog.output_path = next_args(&args, &parsed)
+
+      case "--debug":
+        when ODIN_DEBUG {
+          prog.debug = true
+        } else {
+          fallthrough
+        }
+
       case:
         parsed -= 1
       }
@@ -214,31 +254,6 @@ parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   }
 
   return true
-}
-
-Prog :: struct {
-  img:           ^png.Image,
-  img_path:      string,
-  pixels:        Pixels,
-  scaled_size:   [2]uint,
-  /**/
-  char_gradient: string,
-  scale:         [2]f32,
-  output_path:   string,
-  plain:         bool,
-  view:          bool, // view a .aim file instead of converting from .png image
-  editor:        string,
-  debug:         bool,
-}
-
-prog_init :: proc(using self: ^Prog) {
-  char_gradient = DEFAULT_CHAR_GRADIENT
-  scale = {1, 1}
-}
-
-prog_destroy :: proc(using self: ^Prog) {
-  png.destroy(img)
-  delete(pixels)
 }
 
 load_image :: proc(using prog: ^Prog) -> (ok: bool) {
@@ -346,7 +361,7 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
     )
 
   // NOTE: using libc is faster than os.open for some reason
-  file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w+")
+  file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w")
   if file == nil {
     fmt.eprintln("Failed to open %s", file_path)
     return false
@@ -363,8 +378,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   arena: virtual.Arena
   assert(virtual.arena_init_growing(&arena) == nil)
   defer virtual.arena_destroy(&arena)
-  arena_alloc := virtual.arena_allocator(&arena)
-  context.allocator = arena_alloc
+  context.allocator = virtual.arena_allocator(&arena)
 
   // compress repeated chars to one char with prefix indicating number of repeats
   // the MSB indicates that a byte is an ASCII char if 0 or a repeat count if 1
@@ -373,10 +387,13 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   text := make([dynamic]byte, 0, scaled_size.x * scaled_size.y)
   repeats: byte = 1
   prev_char: byte
-  for i in 0 ..< scaled_size.x * scaled_size.y - 1 {
-    curr_char := pixel_to_ascii(pixels[i], char_gradient)
-    assert(curr_char != 0)
-    if repeats < byte(1 << 7 - 1) - 1 && curr_char == prev_char {   // 7: remaining bits, 1 bits are used for indication
+  for i in 0 ..= scaled_size.x * scaled_size.y {
+    curr_char: byte
+    if i < scaled_size.x * scaled_size.y {
+      curr_char = pixel_to_ascii(pixels[i], char_gradient)
+      assert(curr_char != 0)
+    }
+    if repeats < byte(1 << 7 - 1) && curr_char == prev_char {   // 7: remaining bits, 1 bits are used for indication
       repeats += 1
     } else if i >= 1 {
       if repeats > 1 {
@@ -402,12 +419,15 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
 
   // magic number (8 bytes)
   c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
+
   // stride (u32le, 4 bytes)
   stride := bits.to_le_u32(u32(scaled_size.x))
   c.fwrite(&stride, 1, 4, file)
+
   // number of unique chars + repeat counts (u8, 1 byte)
   huffman_code_len := u8(len(huffman_codes))
   c.fwrite(&huffman_code_len, 1, 1, file)
+
   // lookup table: (k, 1 byte) (huffman_code_len, 1 byte) (huffman_code, <huffman_code_len> bits)
   for k, &v in huffman_codes {
     if debug do print_codes(k, &v)
@@ -416,7 +436,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
       fmt.eprintln("The gradient is too detailed!")
       return false
     }
-    bytes := parse_binary(v, context.temp_allocator)
+    bytes, _ := squeeze_bits(v, context.temp_allocator)
     assert(bytes != nil)
     c.fprintf(file, "%c", k)
     c.fprintf(file, "%c", byte(len(v)))
@@ -424,14 +444,19 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
       c.fprintf(file, "%c", b)
     }
   }
-  // actual data, (huffman_codes)...
+
   encoded_bits := make([dynamic]bool, 0, len(text))
   for char in text {
     for bit in huffman_codes[char] {
       append(&encoded_bits, bit)
     }
   }
-  whole_bytes := parse_binary(Bits(encoded_bits[:]), context.temp_allocator)
+  whole_bytes, unused_bits := squeeze_bits(encoded_bits[:], context.temp_allocator)
+
+  // number of unused bits at the end of file, (u8, 1 byte)
+  c.fprintf(file, "%c", byte(unused_bits))
+
+  // actual data, (huffman_codes)...
   for byte in whole_bytes {
     c.fprintf(file, "%c", byte)
   }
@@ -460,16 +485,17 @@ Aim_Error :: enum u8 {
   Cannot_Read_File = 1,
   Invalid_File     = 2,
   Unexpected_EOF   = 3,
+  Cannot_View      = 4,
 }
 
 Aim_Image :: struct {
   stride:        u32,
   unique_bytes:  u8,
-  huffman_codes: map[byte]string,
+  huffman_codes: map[byte]Bits,
 }
 
 aim_image_init :: proc(using self: ^Aim_Image) {
-  huffman_codes = make(map[byte]string)
+  huffman_codes = make(map[byte]Bits)
 }
 
 aim_image_destroy :: proc(using self: ^Aim_Image) {
@@ -477,9 +503,13 @@ aim_image_destroy :: proc(using self: ^Aim_Image) {
 }
 
 view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
+  arena: virtual.Arena
+  assert(virtual.arena_init_growing(&arena) == nil)
+  defer virtual.arena_destroy(&arena)
+  context.allocator = virtual.arena_allocator(&arena)
+
   file_data, ok := os.read_entire_file(img_path)
   if !ok do return .Cannot_Read_File
-  defer delete(file_data)
 
   file := file_data
 
@@ -498,8 +528,15 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
     length_bits := consume_file_reinterpret(&file, byte) or_return
     length_bytes := (length_bits + 8 - 1) / 8
     value := consume_file(&file, uint(length_bytes)) or_return
-    value_str := bits_to_str(value, uint(length_bits), context.temp_allocator)
-    aim_image.huffman_codes[key] = value_str
+    value_bits := make(Bits, length_bits, context.temp_allocator)
+    for &bit, i in value_bits {
+      byte := value[i / 8]
+      bit = bool(byte & (0b10000000 >> uint(i % 8)))
+    }
+    aim_image.huffman_codes[key] = value_bits
+    if debug {
+      print_codes(key, &aim_image.huffman_codes[key])
+    }
   }
 
   if aim_image.stride <= 0 ||
@@ -508,39 +545,99 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
     return .Invalid_File
   }
 
+  unused_bits := consume_file_reinterpret(&file, u8) or_return
+  data_bytes := consume_file(&file, 0) or_return
+  data_bits := unsqueeze_bits(data_bytes, uint(unused_bits))
+
+  // phase 1: huffman decoding
+  decoded_data := huffman_decode(aim_image.huffman_codes, data_bits)
+
+  file_path :=
+    output_path != "" \
+    ? output_path \
+    : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
+
+  output_file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w")
+  if output_file == nil {
+    fmt.eprintln("Failed to open %s", file_path)
+    return .Cannot_View
+  }
+  defer c.fclose(output_file)
+
+  // phase 2: electric boogaloo
+  repeats: byte = 1
+  written_chars: uint
+  text_sb: strings.Builder
+  strings.builder_init(&text_sb)
+  for byte in decoded_data {
+    if byte & 0b10000000 == 0 {
+      for _ in 0 ..< repeats {
+        fmt.sbprintf(&text_sb, "%c", byte)
+        written_chars += 1
+        if written_chars % uint(aim_image.stride) == 0 {
+          fmt.sbprintln(&text_sb)
+        }
+      }
+      repeats = 1
+    } else {
+      repeats = byte & 0b01111111
+    }
+  }
+  text_cstring := to_cstring(strings.to_string(text_sb))
+
+  if editor == "" || output_path != "" {
+    c.fprintf(output_file, "%s", text_cstring)
+  }
+
+  // TODO: create a simple pager
+  // FIXME: -e is broken
+  //        the end part of the temp file is weirldy missing but the file written using the above fprintf is fine
+  if editor != "" {
+    tmp_file_path := fmt.ctprintf(".#%s#imtoa", img_path)
+    tmp_file := c.fopen(tmp_file_path, "w")
+    if tmp_file == nil {
+      fmt.eprintln("Failed to create temporary file")
+      return .Cannot_View
+    }
+    defer c.fclose(tmp_file)
+
+    defer {
+      rm_cmd: cstring
+      when ODIN_OS == .Windows {
+        rm_cmd = fmt.ctprintf("del %s", tmp_file_path)
+      } else when ODIN_OS ==
+        .Linux || ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD {
+        rm_cmd = fmt.ctprintf("rm %s", tmp_file_path)
+      }
+      if c.system(rm_cmd) != 0 {
+        fmt.eprint("\033[1;33m")
+        fmt.eprintfln("WARNING: Failed to remove temporary file")
+        fmt.eprint("\033[0m")
+      }
+    }
+
+    c.fprintf(tmp_file, "%s", text_cstring)
+    if c.system(fmt.ctprintf("%s '%s'", editor, tmp_file_path)) != 0 {
+      fmt.eprintfln("Failed to open `%s '%s'`", editor, tmp_file_path)
+      return .Cannot_View
+    }
+  }
+
   return .None
-}
-
-bits_to_str :: proc {
-  bits_to_str_small_array,
-  bits_to_str_slice,
-}
-
-bits_to_str_small_array :: proc(bits: Bits, allocator := context.allocator) -> string {
-  sb: strings.Builder
-  strings.builder_init(&sb)
-  for i in 0 ..< len(bits) {
-    strings.write_rune(&sb, bits[i] ? '1' : '0')
-  }
-  return strings.to_string(sb)
-}
-
-bits_to_str_slice :: proc(bits: []byte, len: uint, allocator := context.allocator) -> string {
-  sb: strings.Builder
-  strings.builder_init(&sb, allocator)
-  for i in 0 ..< len {
-    byte := bits[i / 8]
-    bit := bool(byte & (0b10000000 >> uint(i % 8)))
-    strings.write_rune(&sb, bit ? '1' : '0')
-  }
-  return strings.to_string(sb)
 }
 
 consume_file :: proc(buf: ^[]byte, length: uint) -> (result: []byte, err: Aim_Error) {
   buf := buf
-  if uint(len(buf^)) - length < 0 || length == 0 do return nil, .Unexpected_EOF
-  result = buf[:length]
-  buf^ = buf[length:]
+  if uint(len(buf^)) - length < 0 {
+    return nil, .Unexpected_EOF
+  }
+  if length == 0 {
+    result = buf[:]
+    buf^ = nil
+  } else {
+    result = buf[:length]
+    buf^ = buf[length:]
+  }
   return result, .None
 }
 
@@ -549,13 +646,42 @@ consume_file_reinterpret :: proc(buf: ^[]byte, $T: typeid) -> (result: T, err: A
   return intrinsics.unaligned_load((^T)(raw_data(consume_file(buf, size_of(T)) or_return))), .None
 }
 
-// big-endian
-parse_binary :: proc(bits: Bits, allocator := context.allocator) -> []byte {
-  acc := make([]byte, (len(bits) + 8 - 1) / 8, allocator)
-  for i in 0 ..< len(bits) {
-    acc[i / 8] |= byte(bits[i] ? 0x80 : 0x00) >> (uint(i) % 8)
+unsqueeze_bits :: proc(data: []byte, unused_bits: uint, allocator := context.allocator) -> Bits {
+  result := make(Bits, uint(len(data) * 8) - unused_bits, allocator)
+  outer: for byte, i in data {
+    for j in 0 ..< 8 {
+      index := j + i * 8
+      if index >= len(result) do break outer
+      result[index] = byte & (0b10000000 >> uint(j)) == 0 ? false : true
+    }
   }
-  return acc
+  return result
+}
+
+// big-endian
+squeeze_bits :: proc(
+  bits: Bits,
+  allocator := context.allocator,
+) -> (
+  result: []byte,
+  remaining: uint,
+) {
+  length_bytes := (len(bits) + 8 - 1) / 8
+  remaining = uint(length_bytes * 8 - len(bits))
+  result = make([]byte, length_bytes, allocator)
+  for i in 0 ..< len(bits) {
+    result[i / 8] |= byte(bits[i] ? 0x80 : 0x00) >> (uint(i) % 8)
+  }
+  return result, remaining
+}
+
+parse_binary_string :: proc(bits: Bits, allocator := context.allocator) -> string {
+  sb: strings.Builder
+  strings.builder_init(&sb, allocator)
+  for i in 0 ..< len(bits) {
+    strings.write_rune(&sb, bits[i] ? '1' : '0')
+  }
+  return strings.to_string(sb)
 }
 
 /* HUFFMAN ENCODING STUFF */
@@ -623,11 +749,55 @@ huffman_extract_code :: proc(
   }
 }
 
+@(optimization_mode = "speed")
+huffman_decode :: proc(
+  codes_map: map[byte]Bits,
+  data: Bits,
+  allocator := context.allocator,
+) -> []byte {
+  result := make([dynamic]byte, 0, len(data) / 8, allocator)
+
+  min_len: int = max(int)
+  for _, v in codes_map {
+    min_len = min(len(v), min_len)
+  }
+
+  buf := make([dynamic]bool)
+  defer delete(buf)
+  for i in 0 ..= len(data) {
+    bit: ^bool
+    if i < len(data) do bit = &data[i]
+    if len(buf) < min_len && bit != nil {
+      append(&buf, bit^)
+    } else {
+      for k, v in codes_map {
+        if slice.simple_equal(v, buf[:]) {
+          append(&result, k)
+          clear(&buf)
+          break
+        }
+      }
+      if bit != nil do append(&buf, bit^)
+    }
+  }
+
+  return result[:]
+}
+
 print_codes :: proc(k: byte, v: ^Bits) {
   if k & 0b10000000 == 0 {
-    fmt.printfln("'%c': %v", k, bits_to_str(v^, context.temp_allocator))
+    fmt.printfln("'%c': %v", k, parse_binary_string(v^, context.temp_allocator))
   } else {
-    fmt.printfln("%v: %v", k & 0b01111111, bits_to_str(v^, context.temp_allocator))
+    fmt.printfln("%v: %v", k & 0b01111111, parse_binary_string(v^, context.temp_allocator))
   }
+}
+
+to_cstring :: proc(
+  s: string,
+) -> (
+  res: cstring,
+  err: mem.Allocator_Error,
+) #optional_allocator_error {
+  return strings.clone_to_cstring(s, context.temp_allocator)
 }
 
