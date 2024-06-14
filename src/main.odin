@@ -95,10 +95,10 @@ start :: proc() -> (ok: bool) {
 
   if !prog.view {
     load_image(&prog) or_return
-    read_image(&prog)
-    write_txt(&prog) or_return
+    read_image(prog)
+    write_txt(prog) or_return
   } else {
-    err := view_aim(&prog)
+    err := view_aim(prog)
     switch err {
     case .None:
       return true
@@ -135,7 +135,6 @@ Options (view):
 
 parse_args :: proc(prog: ^Prog) -> (ok: bool) {
   next_args :: proc(args: ^[]string, parsed: ^int = nil) -> string {
-    args := args
     if len(args^) <= 0 {
       args^ = nil
       return ""
@@ -285,7 +284,7 @@ load_image :: proc(using prog: ^Prog) -> (ok: bool) {
   return true
 }
 
-read_image :: proc(using prog: ^Prog) {
+read_image :: proc(using prog: Prog) {
   scaled_img_buf: []byte
   if scale == {1, 1} {
     scaled_img_buf = img.pixels.buf[:]
@@ -351,7 +350,7 @@ pixel_to_ascii :: proc(pixel: Pixel, char_gradient: string) -> byte {
   return char_gradient[int(get_lum(pixel) / 0x10)]
 }
 
-write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
+write_txt :: proc(using prog: Prog) -> (ok: bool) {
   file_path :=
     output_path != "" \
     ? output_path \
@@ -361,7 +360,7 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
     )
 
   // NOTE: using libc is faster than os.open for some reason
-  file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w")
+  file := c.fopen(to_cstring(file_path), "w")
   if file == nil {
     fmt.eprintln("Failed to open %s", file_path)
     return false
@@ -374,7 +373,7 @@ write_txt :: proc(using prog: ^Prog) -> (ok: bool) {
   return true
 }
 
-write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
+write_compressed_txt :: proc(using prog: Prog, file: ^c.FILE) -> (ok: bool) {
   arena: virtual.Arena
   assert(virtual.arena_init_growing(&arena) == nil)
   defer virtual.arena_destroy(&arena)
@@ -418,7 +417,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   huffman_extract_code(huffman_tree, &huffman_codes)
 
   // magic number (8 bytes)
-  c.fprintf(file, strings.clone_to_cstring(AIM_MAGIC_NUMBER, context.temp_allocator))
+  c.fprintf(file, to_cstring(AIM_MAGIC_NUMBER))
 
   // stride (u32le, 4 bytes)
   stride := bits.to_le_u32(u32(scaled_size.x))
@@ -430,7 +429,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
 
   // lookup table: (k, 1 byte) (huffman_code_len, 1 byte) (huffman_code, <huffman_code_len> bits)
   for k, &v in huffman_codes {
-    if debug do print_codes(k, &v)
+    if debug do print_codes(k, v)
 
     if len(v) >= 256 {
       fmt.eprintln("The gradient is too detailed!")
@@ -464,7 +463,7 @@ write_compressed_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
   return true
 }
 
-write_plain_txt :: proc(using prog: ^Prog, file: ^c.FILE) -> (ok: bool) {
+write_plain_txt :: proc(using prog: Prog, file: ^c.FILE) -> (ok: bool) {
   text := make([]byte, scaled_size.x * scaled_size.y)
   for &char, i in text {
     char = pixel_to_ascii(pixels[i], char_gradient)
@@ -502,7 +501,7 @@ aim_image_destroy :: proc(using self: ^Aim_Image) {
   delete(huffman_codes)
 }
 
-view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
+view_aim :: proc(using prog: Prog) -> (err: Aim_Error) {
   arena: virtual.Arena
   assert(virtual.arena_init_growing(&arena) == nil)
   defer virtual.arena_destroy(&arena)
@@ -535,7 +534,7 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
     }
     aim_image.huffman_codes[key] = value_bits
     if debug {
-      print_codes(key, &aim_image.huffman_codes[key])
+      print_codes(key, aim_image.huffman_codes[key])
     }
   }
 
@@ -557,7 +556,7 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
     ? output_path \
     : strings.concatenate({filepath.stem(img_path), ".txt"}, context.temp_allocator)
 
-  output_file := c.fopen(strings.clone_to_cstring(file_path, context.temp_allocator), "w")
+  output_file := c.fopen(to_cstring(file_path), "w")
   if output_file == nil {
     fmt.eprintln("Failed to open %s", file_path)
     return .Cannot_View
@@ -627,7 +626,6 @@ view_aim :: proc(using prog: ^Prog) -> (err: Aim_Error) {
 }
 
 consume_file :: proc(buf: ^[]byte, length: uint) -> (result: []byte, err: Aim_Error) {
-  buf := buf
   if uint(len(buf^)) - length < 0 {
     return nil, .Unexpected_EOF
   }
@@ -784,11 +782,11 @@ huffman_decode :: proc(
   return result[:]
 }
 
-print_codes :: proc(k: byte, v: ^Bits) {
+print_codes :: proc(k: byte, v: Bits) {
   if k & 0b10000000 == 0 {
-    fmt.printfln("'%c': %v", k, parse_binary_string(v^, context.temp_allocator))
+    fmt.printfln("'%c': %v", k, parse_binary_string(v, context.temp_allocator))
   } else {
-    fmt.printfln("%v: %v", k & 0b01111111, parse_binary_string(v^, context.temp_allocator))
+    fmt.printfln("%v: %v", k & 0b01111111, parse_binary_string(v, context.temp_allocator))
   }
 }
 
